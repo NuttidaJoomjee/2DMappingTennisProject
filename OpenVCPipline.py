@@ -19,6 +19,11 @@ if not ret:
     raise RuntimeError("Cannot read first frame for court detection")
 
 gray = cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY)
+
+crop_start_y = 10000   # adjust based on where the court actually starts in your frame
+gray_cropped = gray[crop_start_y:, :]
+
+
 _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
 edges = cv2.Canny(thresh, 50, 150)
 lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100, minLineLength=150, maxLineGap=20)
@@ -76,15 +81,69 @@ def line_intersection(line1, line2):
 
 left_line = diagonal_neg[0] if diagonal_neg else None
 right_line = diagonal_pos[0] if diagonal_pos else None
-
 top_line, bottom_line = pick_extreme_lines(horizontal_lines[:10], 1)
+
+# --- BL/BR: automated, as before ---
+#The top line is having a problem but the bottom line is fine so we keep it work normally
+BL = line_intersection(bottom_line, left_line)
+BR = line_intersection(bottom_line, right_line)
+print("BL:", BL, "BR:", BR)
+
+bl_x, bl_y = BL
+br_x, br_y = BR
+
+
+near_baseline_width = abs(br_x - bl_x)
+near_baseline_y = (bl_y + br_y) / 2
+
+search_y_min = near_baseline_y * 0.45
+search_y_max = near_baseline_y * 0.65
+
+candidate_far_lines = [
+    l for l in horizontal_lines
+    if search_y_min <= (l[1] + l[3]) / 2 <= search_y_max
+    and l[4] < near_baseline_width * 0.8
+]
+
+# CHANGED: pick by largest average y (closest to camera among candidates), not longest
+candidate_far_lines.sort(key=lambda l: -((l[1] + l[3]) / 2))
+top_line = candidate_far_lines[0] if candidate_far_lines else None
+
+print(f"Far baseline candidates in range: {len(candidate_far_lines)}")
+print("Selected top_line:", top_line)
 
 TL = line_intersection(top_line, left_line)
 TR = line_intersection(top_line, right_line)
-BL = line_intersection(bottom_line, left_line)
-BR = line_intersection(bottom_line, right_line)
+
+# ============================================================
+# Visual verification
+# ============================================================
+line_check_frame = first_frame.copy()
+
+def draw_line(img, line, color, label):
+    if line is not None:
+        x1, y1, x2, y2 = line[:4]
+        cv2.line(img, (int(x1), int(y1)), (int(x2), int(y2)), color, 3)
+        cv2.putText(img, label, (int(x1), int(y1)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+
+for l in candidate_far_lines:
+    x1, y1, x2, y2, _ = l
+    cv2.line(line_check_frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)  # green = all candidates
+
+draw_line(line_check_frame, top_line, (0, 0, 255), 'top_line (selected)')   # red = chosen one
+draw_line(line_check_frame, bottom_line, (255, 0, 0), 'bottom_line')
+draw_line(line_check_frame, left_line, (0, 255, 0), 'left_line')
+draw_line(line_check_frame, right_line, (0, 255, 255), 'right_line')
+
+cv2.imshow('Lines used for corners', line_check_frame)
+cv2.waitKey(0)
+cv2.destroyAllWindows()
 
 print("BL:", BL, "BR:", BR, "TR:", TR, "TL:", TL)
+
+if BL is not None and TL is not None:
+    print("BL_y > TL_y (should be True):", BL[1] > TL[1])
+
 
 # save court corners to their own CSV
 court_df = pd.DataFrame({
@@ -93,6 +152,8 @@ court_df = pd.DataFrame({
     'TR_x': [TR[0] if TR else None], 'TR_y': [TR[1] if TR else None],
     'TL_x': [TL[0] if TL else None], 'TL_y': [TL[1] if TL else None],
 })
+
+#ตั้งชื่อไฟล์ของ Court ถ้ามีไฟล์นั้นอยู่แล้วให้เพิ่มเลขไป1
 k = 1
 while os.path.exists(f"court_coordinates_{k}.csv"):
     k += 1
@@ -102,18 +163,8 @@ print(f"Saved court corners to court_coordinates_{k}.csv")
 # rewind video back to frame 0, since we already consumed frame 0 above
 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
-# ============================================================
-# STEP 1: Player + ball tracking (your existing pipeline)
-# ============================================================
 
-# Training more tennis ball data to improve the model
-# model.train(
-#     data="C:\Users\ACER\Downloads\tennis ball.v1i.yolov8\data.yaml",
-#     epochs=50,
-#     imgsz=640,
-#     batch=16
-# )
-
+#ตั้งชื่อไฟล์ของ player and ball ถ้ามีไฟล์นัั้นแล้วให้เพิ่มเลขไป1
 i = 1
 while os.path.exists(f"detected_video_{i}.mp4"):
     i += 1
