@@ -7,13 +7,13 @@ import seaborn as sns
 from scipy.signal import find_peaks
 import cv2
 
-court = pd.read_csv(r'D:\TennisProject\court_coordinates_3.csv')
+court = pd.read_csv(r'D:\TennisProject\court_coordinates_4.csv')
 ballAndPlayer_df = pd.read_csv(r'D:\TennisProject\player_tracking_output_3.csv')
 
 # The annotated video from the same pipeline run (detection boxes + court
 # points already drawn on it) -- shown alongside the mapping so detected
 # positions can be checked directly against the source footage.
-video_cap = cv2.VideoCapture(r'D:\TennisProject\detected_video_3.mp4')
+video_cap = cv2.VideoCapture(r'D:\TennisProject\detected_video_4.mp4')
 
 
 # Read the source video's actual fps so playback speed and speed calculations
@@ -22,8 +22,13 @@ video_cap = cv2.VideoCapture(r'D:\TennisProject\detected_video_3.mp4')
 fps = court['fps'].iloc[0] if 'fps' in court.columns else 60
 frame_time = 1/fps
 
-# Standard ITF singles court, meters
+# Standard ITF court, meters. Homography/tracking are still built on the
+# singles width (COURT_WIDTH) -- the doubles sidelines are drawn as extra
+# reference lines only, since baseline/net legitimately span the full
+# doubles width even on a singles-marked court.
 COURT_WIDTH = 8.23
+DOUBLES_WIDTH = 10.97
+DOUBLES_ALLEY = (DOUBLES_WIDTH - COURT_WIDTH) / 2  # 1.37m each side
 COURT_LENGTH = 23.77
 NET_Y = COURT_LENGTH / 2
 SERVICE_LINE_DIST = 6.4
@@ -70,35 +75,94 @@ print(M)
 #Tranform ball pixel to ball mater
 meter_df = ballAndPlayer_df[['frame']].copy() #meter_df built from your actual pipeline's frame column, not the old dataset file ---
 
-for col in ['ball_x', 'ball_y', 'player_1_x', 'player_1_y', 'player_2_x', 'player_2_y']:
+# A tracked "player" ID can, for a stretch of frames, actually be a stationary
+# misdetection nearby (a spectator, the umpire chair/bench near the net) that
+# YOLO's tracker briefly locks onto instead of the real player, then hands
+# back. In pixel space this shows up as a small, tight, far-away cluster of
+# positions distinct from the player's own (much larger) range of movement --
+# caught here with a robust (median + MAD, i.e. outlier-resistant) z-score on
+# raw pixel position, before anything is interpolated or transformed. Applied
+# to players only: the ball's legitimate pixel range is the whole frame, so
+# there's no single "typical cluster" for it to be measured against.
+def reject_pixel_track_outliers(series, threshold=4.0):
+    med = series.median()
+    mad = (series - med).abs().median()
+    if not mad or np.isnan(mad):
+        return series
+    return 0.6745 * (series - med) / mad
+
+
+# player_2 now comes from detect_far_player() in OpenVCPipline.py (a crop +
+# upscale + size-filtered detection dedicated to the far player -- see that
+# function's docstring), which structurally avoids the old bench mixup
+# rather than needing to have it cleaned up afterward here. This pass is
+# kept anyway as a safety net -- cheap, and player_1 already showed zero
+# rejections here even before that fix existed, so leaving it on has no
+# real cost.
+for prefix in ['player_1', 'far_player']:
+    x_col, y_col = f'{prefix}_x', f'{prefix}_y'
+    if x_col not in ballAndPlayer_df.columns:
+        continue
+    combined_z = np.hypot(reject_pixel_track_outliers(ballAndPlayer_df[x_col]),
+                           reject_pixel_track_outliers(ballAndPlayer_df[y_col]))
+    outlier = ballAndPlayer_df[x_col].notna() & (combined_z > 4.0)
+    ballAndPlayer_df.loc[outlier, [x_col, y_col]] = np.nan
+
+for col in ['ball_x', 'ball_y', 'player_1_x', 'player_1_y', 'far_player_x', 'far_player_y']:
     if col in ballAndPlayer_df.columns:
         ballAndPlayer_df[col] = ballAndPlayer_df[col].interpolate()
 
 
-# --- Transform ball pixel -> meter ---
-points = ballAndPlayer_df[['ball_x', 'ball_y']].to_numpy(dtype=np.float32)
-points_reshaped = points.reshape(-1, 1, 2)
-court_points = cv2.perspectiveTransform(points_reshaped, M)
-court_points = court_points.reshape(-1, 2)
-meter_df['ball_meter_x'] = court_points[:, 0]
-meter_df['ball_meter_y'] = court_points[:, 1]
-
-# --- Transform player 1 pixel -> meter ---
-playerR_points = ballAndPlayer_df[['player_1_x', 'player_1_y']].to_numpy(dtype=np.float32)
-playerR_points_reshaped = playerR_points.reshape(-1, 1, 2)
-playerR_court_points = cv2.perspectiveTransform(playerR_points_reshaped, M)
-playerR_court_points = playerR_court_points.reshape(-1, 2)
-meter_df['player_1_x'] = playerR_court_points[:, 0]
-meter_df['player_1_y'] = playerR_court_points[:, 1]
+# --- Transform pixel tracks to meters, then reject positions that land
+# implausibly far outside the court. The perspective transform is
+# near-singular right at the court's vanishing point (real-world distance
+# -> infinity exactly there), so ordinary detection noise near the far
+# baseline -- or, for the ball, linear pixel-space interpolation across a
+# gap that straddles that row -- can blow up into positions tens or even
+# thousands of meters off a 23.77m court (observed: a player foot-position
+# reading of 39m, and ball spikes past 1000m during long detection gaps).
+# Rejecting those and interpolating across just those frames, the same way
+# the raw-pixel gaps above are already handled, keeps a handful of bad
+# frames from corrupting the whole track/speed/distance calculation.
+OUTLIER_MARGIN = 5.0  # meters beyond the court rectangle still treated as plausible
 
 
-# --- Transform player 2 pixel -> meter ---
-playerL_points = ballAndPlayer_df[['player_2_x', 'player_2_y']].to_numpy(dtype=np.float32)
-playerL_points_reshaped = playerL_points.reshape(-1, 1, 2)
-playerL_court_points = cv2.perspectiveTransform(playerL_points_reshaped, M)
-playerL_court_points = playerL_court_points.reshape(-1, 2)
-meter_df['player_2_x'] = playerL_court_points[:, 0]
-meter_df['player_2_y'] = playerL_court_points[:, 1]
+def transform_to_meters(x_col, y_col):
+    pixel_points = ballAndPlayer_df[[x_col, y_col]].to_numpy(dtype=np.float32).reshape(-1, 1, 2)
+    meter_points = cv2.perspectiveTransform(pixel_points, M).reshape(-1, 2)
+    x, y = pd.Series(meter_points[:, 0]), pd.Series(meter_points[:, 1])
+    implausible = ((x < -OUTLIER_MARGIN) | (x > COURT_WIDTH + OUTLIER_MARGIN) |
+                   (y < -OUTLIER_MARGIN) | (y > COURT_LENGTH + OUTLIER_MARGIN))
+    x[implausible] = np.nan
+    y[implausible] = np.nan
+    return x.interpolate(limit_direction='both').to_numpy(), y.interpolate(limit_direction='both').to_numpy()
+
+
+meter_df['ball_meter_x'], meter_df['ball_meter_y'] = transform_to_meters('ball_x', 'ball_y')
+meter_df['player_1_x'], meter_df['player_1_y'] = transform_to_meters('player_1_x', 'player_1_y')
+# "player_2" downstream (plots, legends, distances) is sourced from
+# far_player_x/y -- see the note above the pixel-outlier pass.
+meter_df['player_2_x'], meter_df['player_2_y'] = transform_to_meters('far_player_x', 'far_player_y')
+
+# Even with a player near the far baseline sitting in the homography's
+# sensitive zone (a couple pixels of ordinary detection jitter can still
+# swing a bit in court-space), a short rolling mean smooths out what's left.
+# Went through a few iterations before detect_far_player() existed to fix
+# the noise at its source (crop + upscale + size-filtered detection instead
+# of a generic full-frame tracker) -- a median filter and short (9-frame)
+# windows weren't enough back when the raw data was much noisier, but with
+# the cleaner source data a 45-frame (~0.75s) mean window now brings the far
+# player's worst-case frame-to-frame jump down to ~5 m/s, close to the near
+# player's own ~3-4 m/s, without washing out real side-to-side movement
+# (which plays out over multiple seconds, so much slower than the window).
+# Not applied to the ball: it moves fast enough, with genuine sharp
+# direction changes on contact, that averaging would blur out real motion
+# rather than noise.
+SMOOTHING_WINDOW = 45
+for prefix in ['player_1', 'player_2']:
+    x_col, y_col = f'{prefix}_x', f'{prefix}_y'
+    meter_df[x_col] = meter_df[x_col].rolling(SMOOTHING_WINDOW, center=True, min_periods=1).mean()
+    meter_df[y_col] = meter_df[y_col].rolling(SMOOTHING_WINDOW, center=True, min_periods=1).mean()
 
 # --- compute ball speed and store in meter_df (not the undefined ball_df: Mae ni wa using ball_df) ---
 #From now on will be meter
@@ -143,21 +207,30 @@ trail_length = 10
 
 
 def draw_court(ax, zorder=1, fill_color=None):
-    """Full singles court markings in meter-space -- these are fixed ITF
-    dimensions, so they don't depend on which points got detected in pixel
-    space; only the outer rectangle's corners came from the homography."""
+    """Full court markings in meter-space -- these are fixed ITF dimensions,
+    so they don't depend on which points got detected in pixel space; only
+    the outer rectangle's corners came from the homography. The baseline and
+    net span the full doubles width (they do on a real court, alleys
+    included); the singles sidelines are drawn as extra lines inset from
+    the doubles sidelines, rather than being the outer boundary themselves."""
+    left_d, right_d = -DOUBLES_ALLEY, COURT_WIDTH + DOUBLES_ALLEY
+    line_color = '#E8EDF2'
     if fill_color:
-        ax.fill([0, COURT_WIDTH, COURT_WIDTH, 0], [0, 0, COURT_LENGTH, COURT_LENGTH],
+        ax.fill([left_d, right_d, right_d, left_d], [0, 0, COURT_LENGTH, COURT_LENGTH],
                 color=fill_color, zorder=zorder - 1)
-    ax.plot([0, COURT_WIDTH, COURT_WIDTH, 0, 0], [0, 0, COURT_LENGTH, COURT_LENGTH, 0],
-            color='#E8EDF2', linewidth=1, zorder=zorder)
-    ax.plot([0, COURT_WIDTH], [NEAR_SERVICE_Y, NEAR_SERVICE_Y], color='#E8EDF2', linewidth=1, zorder=zorder)
-    ax.plot([0, COURT_WIDTH], [FAR_SERVICE_Y, FAR_SERVICE_Y], color='#E8EDF2', linewidth=1, zorder=zorder)
-    ax.plot([CENTER_X, CENTER_X], [NEAR_SERVICE_Y, FAR_SERVICE_Y], color='#E8EDF2', linewidth=1, zorder=zorder)
-    ax.plot([0, COURT_WIDTH], [NET_Y, NET_Y], color='dimgray', linewidth=2, zorder=zorder)
-    ax.plot([CENTER_X, CENTER_X], [0, CENTER_MARK_LENGTH], color='#E8EDF2', linewidth=1, zorder=zorder)
+    # outer boundary: baseline + doubles sidelines
+    ax.plot([left_d, right_d, right_d, left_d, left_d], [0, 0, COURT_LENGTH, COURT_LENGTH, 0],
+            color=line_color, linewidth=1, zorder=zorder)
+    # singles sidelines, inset from the doubles sidelines
+    ax.plot([0, 0], [0, COURT_LENGTH], color=line_color, linewidth=1, zorder=zorder)
+    ax.plot([COURT_WIDTH, COURT_WIDTH], [0, COURT_LENGTH], color=line_color, linewidth=1, zorder=zorder)
+    ax.plot([0, COURT_WIDTH], [NEAR_SERVICE_Y, NEAR_SERVICE_Y], color=line_color, linewidth=1, zorder=zorder)
+    ax.plot([0, COURT_WIDTH], [FAR_SERVICE_Y, FAR_SERVICE_Y], color=line_color, linewidth=1, zorder=zorder)
+    ax.plot([CENTER_X, CENTER_X], [NEAR_SERVICE_Y, FAR_SERVICE_Y], color=line_color, linewidth=1, zorder=zorder)
+    ax.plot([left_d, right_d], [NET_Y, NET_Y], color='dimgray', linewidth=2, zorder=zorder)
+    ax.plot([CENTER_X, CENTER_X], [0, CENTER_MARK_LENGTH], color=line_color, linewidth=1, zorder=zorder)
     ax.plot([CENTER_X, CENTER_X], [COURT_LENGTH - CENTER_MARK_LENGTH, COURT_LENGTH],
-            color='#E8EDF2', linewidth=1, zorder=zorder)
+            color=line_color, linewidth=1, zorder=zorder)
 
 
 # Court gets its own axes, and the frame/time label + legend get a separate
@@ -181,15 +254,20 @@ fig.canvas.manager.set_window_title('2D Mapping Window')
 draw_court(mapping_window, fill_color='#133458')
 # Wider than just the court itself -- players commonly stand a couple meters
 # behind the baseline (return position, etc.), and a tight margin was
-# clipping them out of view at the top/bottom edge of the plot.
+# clipping them out of view at the top/bottom edge of the plot. The far
+# player in this clip in particular plays consistently 3-5m behind their
+# baseline (now that detect_far_player() gives an accurate reading instead
+# of noise that happened to average out closer to the line), which on its
+# own exceeded a +3m margin -- widened further to leave headroom beyond
+# just this one clip's observed range.
 mapping_window.set_xlim(-2, COURT_WIDTH + 2)
-mapping_window.set_ylim(-3, COURT_LENGTH + 3)
+mapping_window.set_ylim(-3, COURT_LENGTH + 7)
 mapping_window.set_aspect('equal')
 mapping_window.set_title('2D Mapping Window')
 
 ball_scatter = mapping_window.scatter([], [], color='#838921', s=40)
 player1_scatter = mapping_window.scatter([], [], color='#BD4444', marker='o', s=60)
-player2_scatter = mapping_window.scatter([], [], color='#BD4444', marker='^', s=60)
+player2_scatter = mapping_window.scatter([], [], color='#BD4444', marker='o', s=60)
 
 info_ax.axis('off')
 info_ax.set_xlim(0, 1)
@@ -262,8 +340,8 @@ sns.scatterplot(
     zorder=2
 )
 
-information_window[0,0].set_xlim(-1, 9.23)
-information_window[0,0].set_ylim(-2, 25)
+information_window[0,0].set_xlim(-2, COURT_WIDTH + 2)
+information_window[0,0].set_ylim(-3, COURT_LENGTH + 7)
 information_window[0,0].set_aspect('equal')
 information_window[0,0].set_title('Player 1 - Distance to Ball')
 information_window[0,0].set_xlabel('Court width (m)')
@@ -283,8 +361,8 @@ sns.scatterplot(
     zorder=2
 )
 
-information_window[0,1].set_xlim(-1, 9.23)
-information_window[0,1].set_ylim(-2, 25)
+information_window[0,1].set_xlim(-2, COURT_WIDTH + 2)
+information_window[0,1].set_ylim(-3, COURT_LENGTH + 7)
 information_window[0,1].set_aspect('equal')
 information_window[0,1].set_title('Player 2 - Distance to Ball')
 information_window[0,1].set_xlabel('Court width (m)')
