@@ -5,23 +5,11 @@ import numpy as np
 import pandas as pd
 
 model = YOLO("yolov8n.pt")
-# Used only for the far player (see _detect_far_player below) -- a distant,
-# small player is where per-frame position noise is worst, since a plain
-# detector's box-bottom is imprecise at that scale, and directly at that
-# scale a pose model does even worse (see PROJECT NOTES at _detect_far_player).
+
 pose_model = YOLO("yolov8n-pose.pt")
 LEFT_ANKLE, RIGHT_ANKLE = 15, 16  # COCO keypoint indices
 
-# A first attempt at a fine-tuned tennis-ball model (trained from yolov8n.pt
-# on a ~8500-image Roboflow dataset) was tried here, but a time-boxed run of
-# only ~224 images / 15 epochs wasn't enough for it to learn real ball
-# features -- it converged on "small bright round blob" instead, which made
-# it lock onto a stadium light in this video with higher confidence than the
-# actual ball, every single frame. Worth revisiting with a longer, properly
-# scoped training run; for now falling back to the generic COCO model below
-# (class 32, "sports ball"), same as before that attempt, combined with the
-# plausible-region filter (see BALL_Y_MIN etc. below) which is a genuine net
-# improvement regardless of which model produces the candidate boxes.
+
 ball_model = model
 
 cap = cv2.VideoCapture("D:\\TennisProject\\video1.mp4")
@@ -29,21 +17,8 @@ fps = cap.get(cv2.CAP_PROP_FPS)
 width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-# ============================================================
+
 # STEP 0: Detect court lines and corners.
-#
-# Camera sits near court level (not overhead), so in screen-space the
-# sidelines converge steeply while the baseline/service lines stay
-# almost flat -- and the far baseline/service line are thin, distant,
-# and easily lost to noise. So instead of detecting every line directly,
-# this only detects the lines that are close to the camera and reliable
-# (near baseline, near service line, both sidelines), then finds the far
-# baseline/service line by projective cross-ratio extrapolation along
-# each sideline -- a standard single-view metrology technique: given two
-# known real-world points on a line plus its vanishing point (the image
-# of its point at infinity), the image position of any other point at a
-# known real-world distance is determined without needing to see it.
-# ============================================================
 
 COURT_WIDTH = 8.23     # ITF singles court, meters
 COURT_LENGTH = 23.77
@@ -226,10 +201,7 @@ def detect_court_points(frame):
 
     v_clusters = [c for c in _cluster_diagonal_lines(diagonals) if c["length"] > h * 0.08]
 
-    # Disambiguate real sidelines from same-colored clutter (e.g. a neighboring
-    # court) by how far their intersection with the near baseline extrapolates
-    # beyond the baseline's own visible extent -- the true sideline should be
-    # a small extrapolation, not a big jump.
+    
     left_candidates, right_candidates = [], []
     for c in v_clusters:
         pt = _intersect(near_baseline_l, c["line"])
@@ -305,77 +277,19 @@ def detect_court_points(frame):
 
 
 def far_court_crop_box(court_points, frame_shape):
-    """Pixel region covering roughly the far half of the court (net to well
-    behind the far baseline), used to zoom in on the far player before
-    detecting them. Sized from the actual detected court geometry (not
-    hardcoded) so it still makes sense if the camera/court framing changes.
-    Deliberately generous vertically (a player can stand a couple meters
-    behind the baseline) but kept to the near-service-line's own width
-    horizontally -- that line is already wider on screen than the far
-    baseline (perspective), so it comfortably covers the far player's actual
-    range without also sweeping in known clutter further out (e.g. a bench
-    past the sideline -- excluding that turned out to be a side benefit of
-    this crop, discovered when a generic person-tracker kept latching onto it
-    instead of the real player).
-    """
     h, w = frame_shape[:2]
     xs = [court_points[n][0] for n in ("NSL", "NSR", "TL", "TR") if court_points.get(n)]
     y_baseline = min(court_points[n][1] for n in ("TL", "TR") if court_points.get(n))
     y_near_service = max(court_points[n][1] for n in ("NSL", "NSR") if court_points.get(n))
     x0 = max(0, int(min(xs)))
     x1 = min(w, int(max(xs)))
-    # 130px above the baseline, not just a person-standing-behind-it margin:
-    # a first version used ~60px, which covered the *foot* position fine but
-    # cropped the player's head off above that -- a standing adult's height
-    # extends well above their feet in pixel terms too, and a partial/cropped
-    # subject is much harder for the pose model to detect confidently.
     y0 = max(0, int(y_baseline - 130))
     y1 = min(h, int(y_near_service + 20))        # a little past the net, toward the camera
     return x0, y0, x1, y1
 
 
 def detect_far_player(frame, crop_box, scale=3, ankle_conf_thresh=0.3):
-    """Foot position of the far player, from an upscaled crop of just the
-    far-court region.
-
-    A plain detector run on the *full* frame does find the far player, but
-    only at moderate confidence (their box is tiny -- roughly 50x30px at
-    this camera distance), and the tracker built on top of it would
-    intermittently latch onto a stray same-size false positive nearby
-    instead (a spectator/bench). Cropping to the far-court region and
-    upscaling 3x gives the same physical player far more effective pixels,
-    which raises the plain detector's confidence substantially and, as a
-    side effect, excludes the bench entirely (it's outside the crop) --
-    tested as reliable across 10 sample frames spanning the whole clip
-    (100% detected, vs. ~60% for a first attempt using pose estimation
-    instead of plain detection, see below).
-
-    Pose estimation was tried FIRST as the primary method, on the theory
-    that ankle keypoints are a more direct estimate of foot-ground contact
-    than a bounding box's bottom edge (which is just whatever pixel happens
-    to be lowest -- shoe, shadow, whatever the box-fit lands on). It does
-    still give a real precision improvement when it works. But tested
-    head-to-head against the plain detector on the same 10 frames, it
-    missed the player entirely on 4 of them (even at confidence 0.05) where
-    the plain detector confidently found them (0.72-0.87) -- resolving 17
-    keypoints needs more visual detail than just finding a person-shaped
-    blob does, and that gap doesn't fully close even with the upscaled crop.
-    So this uses the plain detector as the reliable primary source, and
-    opportunistically swaps in ankle keypoints when pose *does* find a
-    confident detection on top of it, rather than trusting pose alone.
-
-    One more wrinkle found in testing: when a player comes forward toward
-    the net, they can be tall enough on screen to poke into the *bottom* of
-    this crop even though their actual feet are well below it (out of
-    frame) -- and since they're much closer to the camera, that partial
-    detection is both larger and higher-confidence than the real, small,
-    fully-in-frame far player elsewhere in the same crop, so naively taking
-    the highest-confidence box picks the wrong person. Measured across
-    several frames, the genuine far player's box is always well under
-    100px tall (37-55px, at original scale) while an intruding near player
-    is always well over (152-207px) -- so candidates are filtered by
-    height before ranking by confidence.
-    """
+   
     MAX_FAR_PLAYER_HEIGHT = 100  # original-scale px; see docstring
 
     x0, y0, x1, y1 = crop_box
@@ -438,13 +352,7 @@ cv2.destroyAllWindows()
 BL, BR, TR, TL = court_points["BL"], court_points["BR"], court_points["TR"], court_points["TL"]
 FAR_COURT_CROP = far_court_crop_box(court_points, first_frame.shape)
 
-# Plausible pixel-space region for the ball. ball_model was trained on a
-# small, time-boxed run and sometimes locks onto a bright round object
-# outside the court (e.g. a stadium light) with higher confidence than the
-# real ball -- it never actually learned ball-specific features, just
-# "small bright blob". The real ball can only ever be within/just above the
-# court during play, so reject any detection well outside the court quad
-# (already known from the corners above) rather than trust it blindly.
+
 _far_y = min(TL[1], TR[1])
 _near_y = max(BL[1], BR[1])
 _court_h = _near_y - _far_y
@@ -459,6 +367,79 @@ BALL_X_MAX = _right_x + _court_w * 0.1
 
 def _ball_in_plausible_region(cx, cy):
     return BALL_X_MIN <= cx <= BALL_X_MAX and BALL_Y_MIN <= cy <= BALL_Y_MAX
+
+STATIC_GRID = 12           # px per cell -- coarser than one ball diameter
+STATIC_HIT_DECAY = 0.97
+STATIC_HIT_THRESHOLD = 20  # ~1s of being detected every frame, at 24-30fps
+_static_hits = {}
+_static_blacklist = set()
+
+
+def _static_cell(cx, cy):
+    return (int(cx) // STATIC_GRID, int(cy) // STATIC_GRID)
+
+
+def _register_ball_candidate(cx, cy):
+    for cell in list(_static_hits):
+        decayed = _static_hits[cell] * STATIC_HIT_DECAY
+        if decayed < 0.01:
+            del _static_hits[cell]
+        else:
+            _static_hits[cell] = decayed
+    cell = _static_cell(cx, cy)
+    _static_hits[cell] = _static_hits.get(cell, 0.0) + 1.0
+    if _static_hits[cell] > STATIC_HIT_THRESHOLD:
+        _static_blacklist.add(cell)
+
+
+def _is_static_fixture(cx, cy):
+    return _static_cell(cx, cy) in _static_blacklist
+
+
+def detect_ball_tiled(frame, tile_size=640, overlap=100, conf=0.1):
+    """Ball candidates across the plausible court region, detected tile by
+    tile at native resolution instead of the whole frame resized at once.
+    Even imgsz=1280 still downsamples a 1920px-wide frame (scale ~0.67),
+    which is real detail lost for an object this small (~25x29px at native
+    res). Tiling at tile_size means no downsampling happens within a tile
+    at all -- the most resolution the detector can possibly get, at the
+    cost of one forward pass per tile instead of one pass per frame.
+    Returns (boxes_xyxy, confs) in original frame coordinates, pooled
+    across all tiles -- may contain near-duplicate boxes for anything
+    sitting in a tile's overlap region, which is harmless here since only
+    the single highest-confidence candidate ends up chosen downstream.
+    """
+    h, w = frame.shape[:2]
+    x0 = max(0, int(BALL_X_MIN))
+    y0 = max(0, int(BALL_Y_MIN))
+    x1 = min(w, int(BALL_X_MAX))
+    y1 = min(h, int(BALL_Y_MAX))
+
+    step = tile_size - overlap
+    xs = list(range(x0, x1, step)) or [x0]
+    ys = list(range(y0, y1, step)) or [y0]
+
+    all_boxes, all_confs = [], []
+    for ty in ys:
+        for tx in xs:
+            tx0, ty0 = max(tx, 0), max(ty, 0)
+            tx1, ty1 = min(tx + tile_size, x1, w), min(ty + tile_size, y1, h)
+            tile = frame[ty0:ty1, tx0:tx1]
+            if tile.shape[0] < 32 or tile.shape[1] < 32:
+                continue
+            r = ball_model.predict(tile, conf=conf, verbose=False, classes=[32])[0]
+            if len(r.boxes) == 0:
+                continue
+            boxes = r.boxes.xyxy.cpu().numpy()
+            confs = r.boxes.conf.cpu().numpy()
+            boxes[:, [0, 2]] += tx0
+            boxes[:, [1, 3]] += ty0
+            all_boxes.append(boxes)
+            all_confs.append(confs)
+
+    if not all_boxes:
+        return np.empty((0, 4)), np.empty((0,))
+    return np.concatenate(all_boxes), np.concatenate(all_confs)
 
 # save all detected court points to their own CSV (columns for points that
 # weren't confidently detected, e.g. NCT, are left blank)
@@ -495,9 +476,10 @@ while True:
         break
 
     player_results = model.track(frame, conf=0.25, tracker="custom_tracker.yaml", verbose=False, classes=[0])
-    ball_results = ball_model.track(frame, conf=0.1, verbose=False, classes=[32])
+    ball_boxes, ball_confs = detect_ball_tiled(frame)
     annotated_frame = player_results[0].plot()
-    annotated_frame = ball_results[0].plot(img=annotated_frame)
+    for bx1, by1, bx2, by2 in ball_boxes:
+        cv2.rectangle(annotated_frame, (int(bx1), int(by1)), (int(bx2), int(by2)), (255, 255, 0), 1)
 
     for pt in [BL, BR, TR, TL]:
         if pt:
@@ -508,6 +490,7 @@ while True:
     if player_results[0].boxes.id is not None:
         boxes = player_results[0].boxes.xyxy.cpu().numpy()
         track_ids = player_results[0].boxes.id.cpu().numpy()
+        #หาตำแหน่งตรงกลางของเท้า
         for box, track_id in zip(boxes, track_ids):
             x1, y1, x2, y2 = box
             foot_x = (x1 + x2) / 2
@@ -521,18 +504,24 @@ while True:
             cv2.putText(annotated_frame, f'P{int(track_id)}', (int(foot_x) + 10, int(foot_y)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-    if len(ball_results[0].boxes) > 0:
-        boxes = ball_results[0].boxes.xyxy.cpu().numpy()
-        confs = ball_results[0].boxes.conf.cpu().numpy()
+    if len(ball_boxes) > 0:
+        boxes = ball_boxes
+        confs = ball_confs
+        chosen = None
         for idx in np.argsort(-confs):  # highest confidence first
             x1, y1, x2, y2 = boxes[idx]
             ball_x = (x1 + x2) / 2
             ball_y = (y1 + y2) / 2
-            if _ball_in_plausible_region(ball_x, ball_y):
-                row['ball_x'] = ball_x
-                row['ball_y'] = ball_y
-                cv2.circle(annotated_frame, (int(ball_x), int(ball_y)), 6, (255, 0, 255), -1)
-                break
+            if not _ball_in_plausible_region(ball_x, ball_y):
+                continue
+            # feed every plausible candidate, even ones we're about to
+            # reject below, so a recurring fixture gets blacklisted fast
+            _register_ball_candidate(ball_x, ball_y)
+            if chosen is None and not _is_static_fixture(ball_x, ball_y):
+                chosen = (ball_x, ball_y)
+        if chosen is not None:
+            row['ball_x'], row['ball_y'] = chosen
+            cv2.circle(annotated_frame, (int(chosen[0]), int(chosen[1])), 6, (255, 0, 255), -1)
 
     far_player_pt = detect_far_player(frame, FAR_COURT_CROP)
     if far_player_pt is not None:

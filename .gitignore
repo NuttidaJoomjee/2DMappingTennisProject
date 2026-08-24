@@ -1,2 +1,16 @@
 .venv/
+venv/
+.vemv/
 __pycache__/
+
+# per-run pipeline output videos -- large and regenerable via
+# OpenVCPipline.py; detected_video_1.mp4 stays tracked as the one
+# reference example (pre-existing convention)
+detected_video_[0-9]*.mp4
+!detected_video_1.mp4
+
+# training dataset (a symlink to a path outside the repo on this machine --
+# not portable, would just commit a broken/local path for anyone else) and
+# training run artifacts (regenerable via train_ball_model.py)
+ball_dataset/
+ball_training_runs/
