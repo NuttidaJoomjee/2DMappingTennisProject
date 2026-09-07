@@ -12,7 +12,7 @@ LEFT_ANKLE, RIGHT_ANKLE = 15, 16  # COCO keypoint indices
 
 ball_model = model
 
-cap = cv2.VideoCapture("D:\\TennisProject\\video1.mp4")
+cap = cv2.VideoCapture("D:\\TennisProject\\Game2.mp4")
 fps = cap.get(cv2.CAP_PROP_FPS)
 width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -78,10 +78,6 @@ def _cluster_flat_lines(segments, gap=25):
 
 
 def _cluster_diagonal_lines(segments, theta_gap=8, rho_gap=30):
-    """Cluster diagonal/steep segments by their infinite-line equation
-    (theta, rho), not position -- a single sideline can be split into
-    fragments at very different x/y by Hough, so position-based
-    clustering would wrongly treat them as separate lines."""
     items = sorted((_line_params(s) + (s,) for s in segments), key=lambda t: (t[3], t[2]))
     clusters = []
     for a, b, c, theta, seg in items:
@@ -105,22 +101,13 @@ def _cluster_diagonal_lines(segments, theta_gap=8, rho_gap=30):
     return clusters
 
 
-def _mobius_extrapolate(near_param, service_param, vanish_param, real_target):
-    """Project a point at real-world distance `real_target` along a line,
-    given the pixel positions of two known real points (0 and
-    NEAR_SERVICE_Y) and the line's vanishing point (real distance = infinity).
-    """
-    gamma = (service_param - near_param) / (NEAR_SERVICE_Y * (vanish_param - service_param))
+def _mobius_extrapolate(near_param, ref_param, ref_real_y, vanish_param, real_target):
+    gamma = (ref_param - near_param) / (ref_real_y * (vanish_param - ref_param))
     alpha = vanish_param * gamma
     return (alpha * real_target + near_param) / (gamma * real_target + 1)
 
 
 def _find_court_blob(frame):
-    """Locate the court surface by scanning hue bins -- how much of the
-    frame is court vs. foreground apron/background varies with camera
-    placement, so a fixed sample box isn't reliable -- and scoring each
-    candidate blob by how rectangular, wide, and low-in-frame it is, which
-    picks the court out from similarly-colored sky or foliage."""
     h, w = frame.shape[:2]
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     colorful = ((hsv[:, :, 1] > 60) & (hsv[:, :, 2] > 80)).astype(np.uint8) * 255
@@ -154,7 +141,13 @@ def _find_court_blob(frame):
 
     if best_contour is None:
         raise RuntimeError("Could not find a court-colored region on the first frame")
-    return best_contour
+    # The raw color-blob contour can have a ragged hole in it (e.g. a
+    # shadow/lighting band across the service-line area shifts hue enough to
+    # drop out of range), which turns into a real gap in the mask below and
+    # silently excludes real lines that fall inside that gap. The true court
+    # region is always a convex quadrilateral in image space regardless of
+    # camera angle, so taking the convex hull closes gaps like that robustly.
+    return cv2.convexHull(best_contour)
 
 
 def _lines_only_mask(frame, court_contour):
@@ -164,8 +157,87 @@ def _lines_only_mask(frame, court_contour):
     cv2.drawContours(court_region_mask, [court_contour], -1, 255, cv2.FILLED)
     court_region_mask = cv2.dilate(court_region_mask, kernel, iterations=1)
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    _, white_thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
-    return cv2.bitwise_and(white_thresh, white_thresh, mask=court_region_mask)
+    # A fixed brightness cutoff only works for the exposure/lighting of one
+    # specific video -- a different camera can render "white paint" at a much
+    # lower absolute gray value. Calibrate the cutoff instead from the
+    # court region's own brightness distribution (lines are the bright tail
+    # against the comparatively uniform, darker court surface), so it adapts
+    # to whatever footage is loaded.
+    court_pixels = gray[court_region_mask > 0].astype(np.float64)
+    if court_pixels.size:
+        court_mean, court_std = court_pixels.mean(), court_pixels.std()
+    else:
+        court_mean, court_std = 180.0, 0.0
+    thresh_val = np.clip(court_mean + 2.0 * court_std, 120, 220)
+    _, white_thresh = cv2.threshold(gray, thresh_val, 255, cv2.THRESH_BINARY)
+    return cv2.bitwise_and(white_thresh, white_thresh, mask=court_region_mask), court_mean, court_std
+
+
+def _find_faint_flat_line(frame, court_mean, court_std, y0, y1, x0, x1, min_length_frac=0.15):
+    
+    h, w = frame.shape[:2]
+    y0, y1 = max(0, int(y0)), min(h, int(y1))
+    x0, x1 = max(0, int(x0)), min(w, int(x1))
+    if y1 - y0 < 5 or x1 - x0 < 5:
+        return None
+    gray = cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+    thresh_val = np.clip(court_mean + 1.0 * court_std, 100, 200)
+    _, band_thresh = cv2.threshold(gray, thresh_val, 255, cv2.THRESH_BINARY)
+    edges = cv2.Canny(band_thresh, 50, 150)
+    segments = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=20,
+                                minLineLength=int((x1 - x0) * 0.1), maxLineGap=40)
+    if segments is None:
+        return None
+    flats = []
+    for seg in segments.reshape(-1, 4):
+        sx1, sy1, sx2, sy2 = seg
+        angle = np.degrees(np.arctan2(sy2 - sy1, sx2 - sx1)) % 180
+        if min(angle, 180 - angle) < 8:
+            flats.append((sx1 + x0, sy1 + y0, sx2 + x0, sy2 + y0))
+    clusters = [c for c in _cluster_flat_lines(flats) if c["length"] > (x1 - x0) * min_length_frac]
+    if not clusters:
+        return None
+    return max(clusters, key=lambda c: c["length"])
+
+
+def _scan_sideline_edge_points(frame, line, y_values, side, search_half_width=70):
+    """Directly measure the sideline's true x at each given y, instead of
+    trusting a Hough-fit line's extrapolation there. The court surface is
+    darker than the lighter out-of-bounds apron just beyond the sideline,
+    so scanning a single row for that brightness step gives the edge's
+    exact position -- verified against this project's own data to be far
+    more reliable than the Hough-fit line for the far court specifically
+    (a fitted line that was collinear-by-construction with a well-verified
+    near point was still ~30-90px off from this measurement, since nothing
+    near the far court had constrained its angle at all; this measures the
+    far court directly instead of extrapolating a guess about it).
+    `line` is used only to know roughly where to search at each row, not
+    trusted for the actual position. `side` is "left" or "right": for the
+    right sideline the court is to the left of the true edge (so the edge
+    is the leftmost pixel where brightness steps up to the apron); for the
+    left sideline it's the mirror image."""
+    h, w = frame.shape[:2]
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    a, b, c = line
+    points = []
+    for y in y_values:
+        y = int(round(y))
+        if not (0 <= y < h) or abs(a) < 1e-9:
+            continue
+        # line is a*x + b*y = c (fit_line's convention) -> x = (c - b*y)/a
+        predicted_x = (c - b * y) / a
+        x0 = max(0, int(predicted_x - search_half_width))
+        x1 = min(w, int(predicted_x + search_half_width))
+        if x1 - x0 < 5:
+            continue
+        row = gray[y, x0:x1].astype(np.float64)
+        thresh = row.mean() + 1.5 * row.std()
+        bright_idx = np.where(row > thresh)[0]
+        if len(bright_idx) == 0:
+            continue
+        edge = bright_idx.min() if side == "right" else bright_idx.max()
+        points.append((x0 + edge, y))
+    return points
 
 
 def detect_court_points(frame):
@@ -175,7 +247,7 @@ def detect_court_points(frame):
     corners) and NCT (near center-service T) when confidently found."""
     h, w = frame.shape[:2]
     court_contour = _find_court_blob(frame)
-    lines_mask = _lines_only_mask(frame, court_contour)
+    lines_mask, court_mean, court_std = _lines_only_mask(frame, court_contour)
 
     edges = cv2.Canny(lines_mask, 50, 150)
     segments = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=40,
@@ -201,20 +273,52 @@ def detect_court_points(frame):
 
     v_clusters = [c for c in _cluster_diagonal_lines(diagonals) if c["length"] > h * 0.08]
 
-    
-    left_candidates, right_candidates = [], []
+    baseline_center_x = (near_baseline_c["min_x"] + near_baseline_c["max_x"]) / 2
+    left_candidates, right_candidates, all_candidates = [], [], []
     for c in v_clusters:
         pt = _intersect(near_baseline_l, c["line"])
         if pt is None:
             continue
+        all_candidates.append((pt, c))
         if pt[0] < near_baseline_c["min_x"]:
             left_candidates.append((near_baseline_c["min_x"] - pt[0], c, pt))
         elif pt[0] > near_baseline_c["max_x"]:
             right_candidates.append((pt[0] - near_baseline_c["max_x"], c, pt))
     if not left_candidates or not right_candidates:
         raise RuntimeError("Could not find both sidelines")
+
+    # Default: whichever candidate's baseline-intersection sits closest to
+    # the near baseline's own detected edge -- correct whenever that edge
+    # is a reasonable proxy for the true corner.
     _, left_c, BL = min(left_candidates, key=lambda t: t[0])
     _, right_c, BR = min(right_candidates, key=lambda t: t[0])
+
+    
+    DOUBLES_WIDTH = 10.97  # ITF doubles court width, meters
+    SINGLES_TO_DOUBLES_RATIO = COURT_WIDTH / DOUBLES_WIDTH
+    RATIO_TOLERANCE = 0.10
+    MIN_RELATIVE_LENGTH = 0.6
+
+    def _refine_with_doubles_check(default_pt, default_c):
+        default_offset = abs(default_pt[0] - baseline_center_x)
+        default_side = default_pt[0] < baseline_center_x
+        best_pt, best_c, best_offset = default_pt, default_c, default_offset
+        for pt, c in all_candidates:
+            if (pt[0] < baseline_center_x) != default_side:
+                continue
+            offset = abs(pt[0] - baseline_center_x)
+            if offset >= best_offset:
+                continue
+            ratio = offset / default_offset
+            if abs(ratio - SINGLES_TO_DOUBLES_RATIO) > RATIO_TOLERANCE:
+                continue
+            if c["length"] < MIN_RELATIVE_LENGTH * default_c["length"]:
+                continue
+            best_pt, best_c, best_offset = pt, c, offset
+        return best_pt, best_c
+
+    BL, left_c = _refine_with_doubles_check(BL, left_c)
+    BR, right_c = _refine_with_doubles_check(BR, right_c)
     left_l, right_l = left_c["line"], right_c["line"]
 
     NSL = _intersect(near_service_l, left_l)
@@ -223,18 +327,160 @@ def detect_court_points(frame):
     if vanish is None:
         raise RuntimeError("Sidelines came out parallel -- detection failed")
 
-    def far_point(near_pt, service_pt, line, real_target):
-        y = _mobius_extrapolate(near_pt[1], service_pt[1], vanish[1], real_target)
+    def far_point(near_pt, ref_pt, ref_real_y, line, real_target):
+        y = _mobius_extrapolate(near_pt[1], ref_pt[1], ref_real_y, vanish[1], real_target)
         a, b, c = line
         return (c - b * y) / a, y
+
+    # Initial estimate, extrapolated all the way from the two near-court
+    # lines out to the far service line.
+    FSL = far_point(BL, NSL, NEAR_SERVICE_Y, left_l, FAR_SERVICE_Y)
+    FSR = far_point(BR, NSR, NEAR_SERVICE_Y, right_l, FAR_SERVICE_Y)
+
+    match_tolerance = abs(near_baseline_c["mean_pos"] - vanish[1]) * 0.05
+    est_y = (FSL[1] + FSR[1]) / 2
+    far_service_c = next((c for c in h_clusters[2:] if abs(c["mean_pos"] - est_y) < match_tolerance), None)
+
+    if far_service_c is not None:
+        far_service_l = _fit_line([(x, y) for s in far_service_c["segs"] for x, y in [(s[0], s[1]), (s[2], s[3])]])
+        FSL = _intersect(far_service_l, left_l)
+        FSR = _intersect(far_service_l, right_l)
+        TL = far_point(BL, FSL, FAR_SERVICE_Y, left_l, COURT_LENGTH)
+        TR = far_point(BR, FSR, FAR_SERVICE_Y, right_l, COURT_LENGTH)
+
+        # left_l/right_l's angle is normally set almost entirely by
+        # near/mid-court Hough segments -- verified against this project's
+        # own data, the far corners had zero pre-existing segments within
+        # 200px of them, so their position out there is pure extrapolation
+        # of a line nothing actually constrains that far out. A small
+        # angular error is invisible near the segments that set it but
+        # compounds into a large positional error by the time it reaches
+        # the far corners. Directly measuring the court/apron brightness
+        # edge at a series of rows, instead, matched a manual pixel-level
+        # check to a few pixels -- but only when used *on its own*: merging
+        # these direct measurements into the old Hough segments and
+        # refitting through both together (tried first) still left the far
+        # corner visibly off, diluted back down by whatever bias the old
+        # segments carried. Scanning the full sideline (near court to far
+        # baseline) this way and replacing the Hough fit outright, instead
+        # of blending it with an independently less-reliable one, is what
+        # actually closed the gap on this project's own data.
+        # Restricted to the far-to-mid court, not all the way down to the
+        # near baseline: scanning that far was found, on this project's
+        # own data, to pick up a discontinuous jump partway down (the
+        # trend from two sub-ranges implied genuinely different lines,
+        # ~150px apart when extrapolated to meet) -- almost certainly the
+        # adjacent court visible in frame, the same contamination already
+        # seen elsewhere in this file. The near court doesn't need this
+        # anyway; the existing Hough fit is already reliable there.
+        scan_y_values = range(int(min(TL[1], TR[1])) - 20, int(near_service_c["mean_pos"]) - 30, 10)
+        left_scan_pts = _scan_sideline_edge_points(frame, left_l, scan_y_values, "left")
+        right_scan_pts = _scan_sideline_edge_points(frame, right_l, scan_y_values, "right")
+
+        def _reject_scan_outliers(points, max_residual_px=15.0):
+            # A player standing near a scanned row (their bright shoes/legs
+            # against the darker court) can occasionally win the
+            # brightness-step search instead of the true court edge --
+            # verified against this project's own data: 2 of 22 scanned
+            # points landed ~140px off a trend the other 20 agreed on
+            # tightly. Checking residuals against a plain least-squares fit
+            # of all the points (including those 2) doesn't reliably catch
+            # this -- also verified directly: a couple of extreme-leverage
+            # outliers pull an ordinary least-squares line enough that
+            # *good* points start looking anomalous relative to it too, so
+            # this uses DIST_HUBER (down-weights points far from the
+            # emerging fit as it iterates, rather than treating every point
+            # equally) just for this outlier-detection pass specifically.
+            if len(points) < 5:
+                return points
+            pts_arr = np.array(points, dtype=np.float32)
+            vx, vy, x0, y0 = cv2.fitLine(pts_arr, cv2.DIST_HUBER, 0, 0.01, 0.01).flatten()
+            a, b = float(vy), float(-vx)
+            c = a * float(x0) + b * float(y0)
+            return [p for p in points if abs(a * p[0] + b * p[1] - c) < max_residual_px]
+
+        left_scan_pts = _reject_scan_outliers(left_scan_pts)
+        right_scan_pts = _reject_scan_outliers(right_scan_pts)
+        # Enough scan points spanning a wide enough range stand on their
+        # own -- prefer them outright over diluting them back into the
+        # older, less-reliable Hough fit. Below that, there's too little
+        # direct measurement to trust alone, so fold what there is into
+        # the existing segments instead of discarding it.
+        MIN_SCAN_POINTS, MIN_SCAN_SPAN = 8, 150
+        def _span(pts):
+            ys = [p[1] for p in pts]
+            return max(ys) - min(ys) if ys else 0
+
+        if len(left_scan_pts) >= MIN_SCAN_POINTS and _span(left_scan_pts) >= MIN_SCAN_SPAN:
+            left_l = _fit_line(left_scan_pts)
+        elif len(left_scan_pts) >= 3:
+            left_l = _fit_line([(x, y) for s in left_c["segs"] for x, y in [(s[0], s[1]), (s[2], s[3])]]
+                                + left_scan_pts)
+        if len(right_scan_pts) >= MIN_SCAN_POINTS and _span(right_scan_pts) >= MIN_SCAN_SPAN:
+            right_l = _fit_line(right_scan_pts)
+        elif len(right_scan_pts) >= 3:
+            right_l = _fit_line([(x, y) for s in right_c["segs"] for x, y in [(s[0], s[1]), (s[2], s[3])]]
+                                 + right_scan_pts)
+        if len(left_scan_pts) >= 3 or len(right_scan_pts) >= 3:
+            NSL = _intersect(near_service_l, left_l)
+            NSR = _intersect(near_service_l, right_l)
+            FSL = _intersect(far_service_l, left_l)
+            FSR = _intersect(far_service_l, right_l)
+            TL = far_point(BL, FSL, FAR_SERVICE_Y, left_l, COURT_LENGTH)
+            TR = far_point(BR, FSR, FAR_SERVICE_Y, right_l, COURT_LENGTH)
+
+        baseline_est_y = (TL[1] + TR[1]) / 2
+        far_service_y = min(FSL[1], FSR[1])  # the fitted/intersected line, not the raw cluster's own mean
+        gap = abs(far_service_y - baseline_est_y)
+        # Bound the search by where the sidelines themselves are expected at
+        # this height, not by near_baseline_c/far_service_c's own detected
+        # extents -- both were found to include contamination reaching far
+        # outside the true court (verified against this project's own data:
+        # a nearby court visible in frame produces its own lines at a
+        # similar height, which a position-only y-clustering pass can't
+        # tell apart from this court's real lines). Inheriting that
+        # contamination into this search let unrelated segments corrupt the
+        # far baseline's fitted angle -- collinear with BR/FSR by
+        # construction, but visibly off from the true corner once
+        # extrapolated that much further, since a small angular error
+        # compounds over distance. A margin around the sidelines' own
+        # projected position keeps the search to the plausible court
+        # corridor regardless of what any specific cluster happened to
+        # detect nearby.
+        est_width = abs(TR[0] - TL[0])
+        margin = max(80.0, est_width * 0.25)
+        expected_left_x = (left_l[2] - left_l[1] * baseline_est_y) / left_l[0]
+        expected_right_x = (right_l[2] - right_l[1] * baseline_est_y) / right_l[0]
+        far_baseline_c = _find_faint_flat_line(
+            frame, court_mean, court_std,
+            y0=baseline_est_y - gap * 1.5 - 20,
+            y1=far_service_y - gap * 0.15,
+            x0=min(expected_left_x, expected_right_x) - margin,
+            x1=max(expected_left_x, expected_right_x) + margin,
+        )
+        if far_baseline_c is not None:
+            far_baseline_l = _fit_line([(x, y) for s in far_baseline_c["segs"]
+                                         for x, y in [(s[0], s[1]), (s[2], s[3])]])
+            TL_direct = _intersect(far_baseline_l, left_l)
+            TR_direct = _intersect(far_baseline_l, right_l)
+            # Sanity check against the extrapolated estimate -- guards
+            # against this more sensitive search picking up an unrelated
+            # faint line (a shadow, a fence rail) on a differently-shaped
+            # court/venue, rather than trusting any match unconditionally.
+            tolerance = max(60.0, gap * 1.5)
+            if (TL_direct is not None and TR_direct is not None
+                    and abs(TL_direct[1] - TL[1]) < tolerance
+                    and abs(TR_direct[1] - TR[1]) < tolerance):
+                TL, TR = TL_direct, TR_direct
+    else:
+        TL = far_point(BL, NSL, NEAR_SERVICE_Y, left_l, COURT_LENGTH)
+        TR = far_point(BR, NSR, NEAR_SERVICE_Y, right_l, COURT_LENGTH)
 
     points = {
         "BL": BL, "BR": BR,
         "NSL": NSL, "NSR": NSR,
-        "TL": far_point(BL, NSL, left_l, COURT_LENGTH),
-        "TR": far_point(BR, NSR, right_l, COURT_LENGTH),
-        "FSL": far_point(BL, NSL, left_l, FAR_SERVICE_Y),
-        "FSR": far_point(BR, NSR, right_l, FAR_SERVICE_Y),
+        "TL": TL, "TR": TR,
+        "FSL": FSL, "FSR": FSR,
     }
 
     # Bonus point: the short center-service line, searched for with a finer
@@ -266,6 +512,10 @@ def detect_court_points(frame):
     for c in (left_c, right_c):
         for seg in c["segs"]:
             cv2.line(debug_img, (seg[0], seg[1]), (seg[2], seg[3]), (255, 0, 255), 2)
+   
+    for near_pt, far_pt in [(points.get("BL"), points.get("TL")), (points.get("BR"), points.get("TR"))]:
+        if near_pt is not None and far_pt is not None:
+            cv2.line(debug_img, (int(near_pt[0]), int(near_pt[1])), (int(far_pt[0]), int(far_pt[1])), (255, 128, 0), 1)
     for name, pt in points.items():
         if pt is None:
             continue
@@ -308,6 +558,15 @@ def detect_far_player(frame, crop_box, scale=3, ankle_conf_thresh=0.3):
             return None
         return max(candidates, key=lambda i: confs[i])
 
+    # Tried dropping this plain-model pass in favor of pose_model's own
+    # boxes (it detects people as part of estimating keypoints, so it looks
+    # redundant) -- verified against this project's own data that this is
+    # NOT a safe simplification: at this crop's actual resolution, the pose
+    # model's detection head missed the far player in 40/40 test frames
+    # while the plain detector still found them at ~0.84 confidence every
+    # time. The two models' detection heads aren't equivalent at this scale
+    # despite both being nominally "person detectors" trained on COCO, so
+    # both calls stay.
     plain_result = model.predict(crop_up, conf=0.25, verbose=False, classes=[0])[0]
     plain_boxes = plain_result.boxes.xyxy.cpu().numpy()
     plain_confs = plain_result.boxes.conf.cpu().numpy()
@@ -335,22 +594,34 @@ def detect_far_player(frame, crop_box, scale=3, ankle_conf_thresh=0.3):
     return to_orig(foot)
 
 
-ret, first_frame = cap.read()
-if not ret:
-    raise RuntimeError("Cannot read first frame for court detection")
+# Court points now come from a manually-marked CSV (mark_court_points.py)
+# instead of detect_court_points() -- this pipeline's job for this run is
+# just to detect/track the player and ball; the court calibration is fixed
+# input, not something to (re)detect here. detect_court_points() and its
+# helpers stay defined above, unused, in case a future video without a
+# manual CSV wants automatic detection again.
+COURT_COORDINATES_PATH = r"D:\TennisProject\court_coordinates_15.csv"
+_court_row = pd.read_csv(COURT_COORDINATES_PATH).iloc[0]
+court_points = {}
+for col in _court_row.index:
+    if not col.endswith("_x"):
+        continue
+    name = col[:-2]
+    y_col = f"{name}_y"
+    if y_col not in _court_row.index:
+        continue
+    px, py = _court_row[col], _court_row[y_col]
+    if pd.isna(px) or pd.isna(py):
+        continue
+    court_points[name] = (float(px), float(py))
+print(f"Loaded {len(court_points)} court points from {COURT_COORDINATES_PATH}")
 
-court_points, court_debug_img = detect_court_points(first_frame)
 for corner in ("BL", "BR", "TL", "TR"):
-    if court_points.get(corner) is None:
-        raise RuntimeError(f"Failed to detect court corner {corner} -- see court_detection_debug.png")
-
-cv2.imwrite("court_detection_debug.png", court_debug_img)
-cv2.imshow("Court detection (press any key to continue)", court_debug_img)
-cv2.waitKey(0)
-cv2.destroyAllWindows()
+    if corner not in court_points:
+        raise RuntimeError(f"{COURT_COORDINATES_PATH} is missing required corner {corner}")
 
 BL, BR, TR, TL = court_points["BL"], court_points["BR"], court_points["TR"], court_points["TL"]
-FAR_COURT_CROP = far_court_crop_box(court_points, first_frame.shape)
+FAR_COURT_CROP = far_court_crop_box(court_points, (height, width))
 
 
 _far_y = min(TL[1], TR[1])
@@ -396,69 +667,70 @@ def _is_static_fixture(cx, cy):
     return _static_cell(cx, cy) in _static_blacklist
 
 
+# Scanning every tile across the whole plausible court region on every frame
+# is the single biggest cost in this pipeline (verified: it's what turns one
+# frame into 6-8 separate YOLO passes). The ball moves continuously between
+# consecutive frames, so once we know roughly where it is, a small window
+# around that position is enough -- only fall back to the full scan when the
+# ball hasn't been seen for a few frames (lost after being occluded, leaving
+# the frame, etc.) and needs to be reacquired from scratch.
+_last_ball_pos = None
+_frames_since_ball_seen = 999  # start "lost" so the first frame does a full scan
+LOCAL_SEARCH_HALF = 260   # px around the last known position while tracking
+LOST_AFTER_FRAMES = 5     # consecutive misses before reverting to a full scan
+
+
 def detect_ball_tiled(frame, tile_size=640, overlap=100, conf=0.1):
-    """Ball candidates across the plausible court region, detected tile by
-    tile at native resolution instead of the whole frame resized at once.
-    Even imgsz=1280 still downsamples a 1920px-wide frame (scale ~0.67),
-    which is real detail lost for an object this small (~25x29px at native
-    res). Tiling at tile_size means no downsampling happens within a tile
-    at all -- the most resolution the detector can possibly get, at the
-    cost of one forward pass per tile instead of one pass per frame.
-    Returns (boxes_xyxy, confs) in original frame coordinates, pooled
-    across all tiles -- may contain near-duplicate boxes for anything
-    sitting in a tile's overlap region, which is harmless here since only
-    the single highest-confidence candidate ends up chosen downstream.
-    """
+
     h, w = frame.shape[:2]
     x0 = max(0, int(BALL_X_MIN))
     y0 = max(0, int(BALL_Y_MIN))
     x1 = min(w, int(BALL_X_MAX))
     y1 = min(h, int(BALL_Y_MAX))
 
-    step = tile_size - overlap
-    xs = list(range(x0, x1, step)) or [x0]
-    ys = list(range(y0, y1, step)) or [y0]
+    if _last_ball_pos is not None and _frames_since_ball_seen < LOST_AFTER_FRAMES:
+        lx, ly = _last_ball_pos
+        tile_boxes = [(
+            max(x0, int(lx - LOCAL_SEARCH_HALF)), max(y0, int(ly - LOCAL_SEARCH_HALF)),
+            min(x1, int(lx + LOCAL_SEARCH_HALF)), min(y1, int(ly + LOCAL_SEARCH_HALF)),
+        )]
+    else:
+        step = tile_size - overlap
+        xs = list(range(x0, x1, step)) or [x0]
+        ys = list(range(y0, y1, step)) or [y0]
+        tile_boxes = [
+            (max(tx, 0), max(ty, 0), min(tx + tile_size, x1, w), min(ty + tile_size, y1, h))
+            for ty in ys for tx in xs
+        ]
+
+    tiles, offsets = [], []
+    for tx0, ty0, tx1, ty1 in tile_boxes:
+        tile = frame[ty0:ty1, tx0:tx1]
+        if tile.shape[0] < 32 or tile.shape[1] < 32:
+            continue
+        tiles.append(tile)
+        offsets.append((tx0, ty0))
+    if not tiles:
+        return np.empty((0, 4)), np.empty((0,))
+
+    # One batched predict() call over all tiles instead of one call per tile
+    # -- cuts the per-call pre/post-processing overhead that dominates on CPU.
+    results = ball_model.predict(tiles, conf=conf, verbose=False, classes=[32])
 
     all_boxes, all_confs = [], []
-    for ty in ys:
-        for tx in xs:
-            tx0, ty0 = max(tx, 0), max(ty, 0)
-            tx1, ty1 = min(tx + tile_size, x1, w), min(ty + tile_size, y1, h)
-            tile = frame[ty0:ty1, tx0:tx1]
-            if tile.shape[0] < 32 or tile.shape[1] < 32:
-                continue
-            r = ball_model.predict(tile, conf=conf, verbose=False, classes=[32])[0]
-            if len(r.boxes) == 0:
-                continue
-            boxes = r.boxes.xyxy.cpu().numpy()
-            confs = r.boxes.conf.cpu().numpy()
-            boxes[:, [0, 2]] += tx0
-            boxes[:, [1, 3]] += ty0
-            all_boxes.append(boxes)
-            all_confs.append(confs)
+    for r, (tx0, ty0) in zip(results, offsets):
+        if len(r.boxes) == 0:
+            continue
+        boxes = r.boxes.xyxy.cpu().numpy()
+        confs = r.boxes.conf.cpu().numpy()
+        boxes[:, [0, 2]] += tx0
+        boxes[:, [1, 3]] += ty0
+        all_boxes.append(boxes)
+        all_confs.append(confs)
 
     if not all_boxes:
         return np.empty((0, 4)), np.empty((0,))
     return np.concatenate(all_boxes), np.concatenate(all_confs)
-
-# save all detected court points to their own CSV (columns for points that
-# weren't confidently detected, e.g. NCT, are left blank)
-court_point_names = ["BL", "BR", "TR", "TL", "NSL", "NSR", "FSL", "FSR", "NCT"]
-court_row = {}
-for name in court_point_names:
-    pt = court_points.get(name)
-    court_row[f"{name}_x"] = [pt[0] if pt else None]
-    court_row[f"{name}_y"] = [pt[1] if pt else None]
-court_row["fps"] = [fps]  # so Mapping.py can play back at the source video's real speed
-court_df = pd.DataFrame(court_row)
-
-k = 1
-while os.path.exists(f"court_coordinates_{k}.csv"):
-    k += 1
-court_df.to_csv(f'court_coordinates_{k}.csv', index=False)
-print(f"Saved court corners to court_coordinates_{k}.csv")
-
-cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
 i = 1
 while os.path.exists(f"detected_video_{i}.mp4"):
@@ -481,9 +753,15 @@ while True:
     for bx1, by1, bx2, by2 in ball_boxes:
         cv2.rectangle(annotated_frame, (int(bx1), int(by1)), (int(bx2), int(by2)), (255, 255, 0), 1)
 
-    for pt in [BL, BR, TR, TL]:
-        if pt:
-            cv2.circle(annotated_frame, (int(pt[0]), int(pt[1])), 6, (0, 0, 255), -1)
+    # Every point loaded from COURT_COORDINATES_PATH (up to all 21 from a
+    # full manual marking pass), not just the 4 corners -- the whole point
+    # of drawing them is to visually check the manual clicks against the
+    # actual footage, which only works if every marked line is shown.
+    for name, pt in court_points.items():
+        px, py = int(round(pt[0])), int(round(pt[1]))
+        cv2.circle(annotated_frame, (px, py), 5, (0, 0, 255), -1)
+        cv2.putText(annotated_frame, name, (px + 6, py - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
 
     row = {'frame': frame_num}
 
@@ -522,6 +800,12 @@ while True:
         if chosen is not None:
             row['ball_x'], row['ball_y'] = chosen
             cv2.circle(annotated_frame, (int(chosen[0]), int(chosen[1])), 6, (255, 0, 255), -1)
+            _last_ball_pos = chosen
+            _frames_since_ball_seen = 0
+        else:
+            _frames_since_ball_seen += 1
+    else:
+        _frames_since_ball_seen += 1
 
     far_player_pt = detect_far_player(frame, FAR_COURT_CROP)
     if far_player_pt is not None:

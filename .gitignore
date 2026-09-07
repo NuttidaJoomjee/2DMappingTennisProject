@@ -1,6 +1,7 @@
 .venv/
 venv/
 .vemv/
+.evnv/
 __pycache__/
 
 # per-run pipeline output videos -- large and regenerable via
